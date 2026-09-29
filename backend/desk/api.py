@@ -1,12 +1,14 @@
-from datetime import datetime
+from datetime import datetime, time
 from typing import Optional
 
 from django.http import HttpRequest
+from django.utils import timezone
 from ninja import NinjaAPI, Schema
 from ninja.errors import HttpError
 
 from desk.auth_utils import bearer_auth, create_access_token, verify_password
-from desk.models import OffsetSubmission, User
+from desk.models import BanRejection, BanWindow, OffsetSubmission, User
+from desk.services import create_submission_with_ban_gate
 
 api = NinjaAPI(title="数控刀补复核台", version="1.0")
 
@@ -54,6 +56,51 @@ def _to_out(row: OffsetSubmission) -> SubmissionOut:
     )
 
 
+class BanWindowIn(Schema):
+    # 服务器本地钟点，HH:MM。start == end 视为全天禁交；start > end 视为跨夜。
+    start_time: time
+    end_time: time
+
+
+class BanWindowOut(Schema):
+    configured: bool
+    start_time: Optional[time]
+    end_time: Optional[time]
+    is_banned_now: bool
+    server_time: datetime
+
+
+class BanRejectionOut(Schema):
+    id: int
+    tool_code: str
+    offset_um: int
+    rejected_by: Optional[str]
+    start_time: time
+    end_time: time
+    server_time: datetime
+    created_at: datetime
+
+
+def _window_payload(window: Optional[BanWindow]) -> dict:
+    # 状态判定只信服务器此刻，不接受任何前端钟点。
+    now = timezone.now()
+    if window is None:
+        return {
+            "configured": False,
+            "start_time": None,
+            "end_time": None,
+            "is_banned_now": False,
+            "server_time": now,
+        }
+    return {
+        "configured": True,
+        "start_time": window.start_time,
+        "end_time": window.end_time,
+        "is_banned_now": window.contains(now),
+        "server_time": now,
+    }
+
+
 @api.get("/health", response=HealthOut)
 def health(request: HttpRequest):
     return {"status": "ok"}
@@ -99,10 +146,48 @@ def create_submission(request: HttpRequest, body: SubmissionIn):
     tool_code = body.tool_code.strip()
     if not tool_code:
         raise HttpError(400, "刀具编号不能为空")
-    row = OffsetSubmission.objects.create(
+    # 挡回判定与流水已在 service 的同一事务内提交，403 在事务提交后返回。
+    result = create_submission_with_ban_gate(
+        user=user,
         tool_code=tool_code,
         offset_um=body.offset_um,
-        submitted_by=user,
-        status=OffsetSubmission.Status.PENDING,
     )
-    return _to_out(row)
+    if result.blocked:
+        raise HttpError(403, result.message)
+    return _to_out(result.submission)
+
+
+@api.get("/ban/window", response=BanWindowOut, auth=bearer_auth)
+def get_ban_window(request: HttpRequest):
+    return _window_payload(BanWindow.get())
+
+
+@api.put("/ban/window", response=BanWindowOut, auth=bearer_auth)
+def update_ban_window(request: HttpRequest, body: BanWindowIn):
+    user: User = request.auth
+    if not user.can_write:
+        raise HttpError(403, "只读账号不能修改禁交钟点")
+    window = BanWindow.get() or BanWindow(pk=BanWindow.SINGLETON_ID)
+    window.start_time = body.start_time
+    window.end_time = body.end_time
+    window.updated_by = user
+    window.save()
+    return _window_payload(window)
+
+
+@api.get("/ban/rejections", response=list[BanRejectionOut], auth=bearer_auth)
+def list_ban_rejections(request: HttpRequest):
+    rows = BanRejection.objects.select_related("rejected_by")[:200]
+    return [
+        BanRejectionOut(
+            id=r.id,
+            tool_code=r.tool_code,
+            offset_um=r.offset_um,
+            rejected_by=r.rejected_by.username if r.rejected_by else None,
+            start_time=r.start_time,
+            end_time=r.end_time,
+            server_time=r.server_time,
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]

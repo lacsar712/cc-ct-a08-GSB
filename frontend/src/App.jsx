@@ -2,11 +2,14 @@ import { createSignal, onMount, Show, For, createEffect } from "solid-js";
 import {
   clearSession,
   createSubmission,
+  fetchBanRejections,
+  fetchBanWindow,
   fetchSubmission,
   fetchSubmissions,
   getUser,
   login,
   setSession,
+  updateBanWindow,
 } from "./api";
 
 const statusLabel = {
@@ -24,7 +27,13 @@ function readHash() {
   const raw = (location.hash || "#/").replace(/^#/, "") || "/";
   const m = raw.match(/^\/detail\/(\d+)/);
   if (m) return { name: "detail", id: Number(m[1]) };
+  if (raw === "/ban") return { name: "ban", id: null };
   return { name: "home", id: null };
+}
+
+function toHM(t) {
+  // 服务端返回 "HH:MM:SS"，<input type="time"> 用 HH:MM
+  return t ? t.slice(0, 5) : "";
 }
 
 function App() {
@@ -33,6 +42,7 @@ function App() {
   const [detail, setDetail] = createSignal(null);
   const [route, setRoute] = createSignal(readHash());
   const [error, setError] = createSignal("");
+  const [notice, setNotice] = createSignal("");
   const [loading, setLoading] = createSignal(false);
 
   const [loginUser, setLoginUser] = createSignal("machinist");
@@ -41,12 +51,24 @@ function App() {
   const [toolCode, setToolCode] = createSignal("");
   const [offsetUm, setOffsetUm] = createSignal("");
 
+  // 禁交台状态：一切以后台返回为准，不看前端本地钟点
+  const [banWindow, setBanWindow] = createSignal(null);
+  const [rejections, setRejections] = createSignal([]);
+  const [banStart, setBanStart] = createSignal("00:00");
+  const [banEnd, setBanEnd] = createSignal("00:00");
+  const [banLoading, setBanLoading] = createSignal(false);
+  const [banSaving, setBanSaving] = createSignal(false);
+
   function goHome() {
     location.hash = "#/";
   }
 
   function goDetail(id) {
     location.hash = `#/detail/${id}`;
+  }
+
+  function goBan() {
+    location.hash = "#/ban";
   }
 
   async function loadRows() {
@@ -75,12 +97,49 @@ function App() {
     }
   }
 
+  function applyWindow(data) {
+    setBanWindow(data);
+    if (data.configured) {
+      setBanStart(toHM(data.start_time));
+      setBanEnd(toHM(data.end_time));
+    }
+  }
+
+  async function loadBanWindow() {
+    try {
+      applyWindow(await fetchBanWindow());
+    } catch (e) {
+      // 状态条不应因一次拉取失败就谎称可交：清空并提示
+      setBanWindow(null);
+      setError(e.message);
+    }
+  }
+
+  async function loadRejections() {
+    try {
+      setRejections(await fetchBanRejections());
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
+  async function loadBan() {
+    setBanLoading(true);
+    setError("");
+    await Promise.all([loadBanWindow(), loadRejections()]);
+    setBanLoading(false);
+  }
+
   onMount(() => {
     const onHash = () => setRoute(readHash());
     window.addEventListener("hashchange", onHash);
     if (user()) {
       if (route().name === "detail") loadDetail(route().id);
-      else loadRows();
+      else if (route().name === "ban") loadBan();
+      else {
+        loadRows();
+        loadBanWindow();
+      }
     }
     return () => window.removeEventListener("hashchange", onHash);
   });
@@ -89,7 +148,11 @@ function App() {
     const r = route();
     if (!user()) return;
     if (r.name === "detail" && r.id) loadDetail(r.id);
-    if (r.name === "home") loadRows();
+    else if (r.name === "ban") loadBan();
+    else {
+      loadRows();
+      loadBanWindow();
+    }
   });
 
   async function handleLogin(e) {
@@ -105,6 +168,7 @@ function App() {
       setUser(getUser());
       goHome();
       await loadRows();
+      await loadBanWindow();
     } catch (err) {
       setError(err.message);
     }
@@ -115,20 +179,72 @@ function App() {
     setUser(null);
     setRows([]);
     setDetail(null);
+    setBanWindow(null);
+    setRejections([]);
     goHome();
   }
 
   async function handleSubmit(e) {
     e.preventDefault();
     setError("");
+    setNotice("");
     try {
       await createSubmission(toolCode(), offsetUm());
       setToolCode("");
       setOffsetUm("");
+      setNotice("刀补已提交，等待复核。");
       await loadRows();
     } catch (err) {
+      // 后台才是最终裁决；被挡后立即以服务器状态刷新徽章，绝不只改提示放过写接口
       setError(err.message);
+    } finally {
+      await loadBanWindow();
     }
+  }
+
+  async function handleSaveBan(e) {
+    e.preventDefault();
+    setError("");
+    setNotice("");
+    if (!banStart() || !banEnd()) {
+      setError("请填写每日禁交起止钟点");
+      return;
+    }
+    setBanSaving(true);
+    try {
+      const data = await updateBanWindow(banStart(), banEnd());
+      applyWindow(data);
+      await loadRejections();
+      setNotice(
+        data.start_time === data.end_time || banStart() === banEnd()
+          ? "禁交钟点已保存并立即生效：起止相同，全天禁交。"
+          : "禁交钟点已保存并立即生效（起晚于止视为跨夜，含起止钟点）。"
+      );
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBanSaving(false);
+    }
+  }
+
+  function BanBadge(props) {
+    const w = () => props.window;
+    return (
+      <Show
+        when={w()}
+        fallback={<span class="badge badge-unknown">禁交状态读取中…（以后台为准）</span>}
+      >
+        <span class={w().is_banned_now ? "badge badge-ban" : "badge badge-ok"}>
+          {w().is_banned_now ? "此刻禁交" : "此刻可交"}
+        </span>
+        <span class="hint">
+          服务器时刻 {new Date(w().server_time).toLocaleString()}
+          {w().configured
+            ? `｜每日禁交 ${toHM(w().start_time)}–${toHM(w().end_time)}（含起止钟点）`
+            : "｜尚未设置禁交钟点"}
+        </span>
+      </Show>
+    );
   }
 
   return (
@@ -136,7 +252,7 @@ function App() {
       <header class="topbar">
         <div class="brand">
           <h1>数控刀补复核台</h1>
-          <p class="hint">刀补绝对值不超过十二微米判合格，否则超差。后台认领进程用行锁跳过已占行领取待复核。</p>
+          <p class="hint">刀补绝对值不超过十二微米判合格，否则超差。夜班禁交时段由后台按服务器钟点闭区间挡回。</p>
         </div>
         <Show when={user()}>
           <nav class="topnav">
@@ -150,12 +266,25 @@ function App() {
             >
               复核总览
             </a>
+            <a
+              href="#/ban"
+              class={route().name === "ban" ? "active" : ""}
+              onClick={(e) => {
+                e.preventDefault();
+                goBan();
+              }}
+            >
+              禁交台
+            </a>
           </nav>
         </Show>
       </header>
 
       <Show when={error()}>
         <div class="banner error">{error()}</div>
+      </Show>
+      <Show when={notice()}>
+        <div class="banner ok">{notice()}</div>
       </Show>
 
       <Show
@@ -195,6 +324,19 @@ function App() {
         </section>
 
         <Show when={route().name === "home"}>
+          <section class="card">
+            <div class="toolbar">
+              <h2>此刻是否禁交</h2>
+              <button type="button" class="ghost" onClick={loadBanWindow}>
+                刷新服务器状态
+              </button>
+            </div>
+            <p class="status-line">
+              <BanBadge window={banWindow()} />
+            </p>
+            <p class="hint">能否交刀补一律由后台按服务器时刻裁决，本机改钟点无效。</p>
+          </section>
+
           <Show when={user().can_write}>
             <section class="card">
               <h2>提交刀补</h2>
@@ -263,6 +405,103 @@ function App() {
             </table>
             <Show when={!rows().length && !loading()}>
               <p class="hint">暂无记录</p>
+            </Show>
+          </section>
+        </Show>
+
+        <Show when={route().name === "ban"}>
+          <section class="card">
+            <div class="toolbar">
+              <h2>禁交台 · 此刻是否禁交</h2>
+              <button type="button" class="ghost" onClick={loadBan} disabled={banLoading()}>
+                {banLoading() ? "刷新中…" : "刷新"}
+              </button>
+            </div>
+            <p class="status-line">
+              <BanBadge window={banWindow()} />
+            </p>
+          </section>
+
+          <section class="card">
+            <h2>禁交钟点设置</h2>
+            <Show
+              when={user().can_write}
+              fallback={
+                <div>
+                  <p class="hint">
+                    当前为只读账号，禁交钟点如下，不可修改：
+                  </p>
+                  <p>
+                    每日禁交：
+                    <strong>
+                      <Show when={banWindow()?.configured} fallback={"尚未设置"}>
+                        {toHM(banWindow().start_time)}–{toHM(banWindow().end_time)}
+                      </Show>
+                    </strong>
+                    （闭区间，含起止钟点）
+                  </p>
+                </div>
+              }
+            >
+              <form onSubmit={handleSaveBan} class="form inline">
+                <label>
+                  每日禁交起
+                  <input
+                    type="time"
+                    value={banStart()}
+                    onInput={(e) => setBanStart(e.currentTarget.value)}
+                    required
+                  />
+                </label>
+                <label>
+                  每日禁交止
+                  <input
+                    type="time"
+                    value={banEnd()}
+                    onInput={(e) => setBanEnd(e.currentTarget.value)}
+                    required
+                  />
+                </label>
+                <button type="submit" disabled={banSaving()}>
+                  {banSaving() ? "保存中…" : "保存并立即生效"}
+                </button>
+              </form>
+              <p class="hint">
+                起钟点晚于止钟点视为跨夜（夜班）；起止相同视为全天禁交。判定与计时均在后台按服务器时刻执行。
+              </p>
+            </Show>
+          </section>
+
+          <section class="card">
+            <h2>禁交流水（挡回记录）</h2>
+            <table>
+              <thead>
+                <tr>
+                  <th>服务器判定时刻</th>
+                  <th>刀具</th>
+                  <th>刀补 µm</th>
+                  <th>命中禁交时段</th>
+                  <th>操作人</th>
+                </tr>
+              </thead>
+              <tbody>
+                <For each={rejections()}>
+                  {(r) => (
+                    <tr>
+                      <td>{new Date(r.server_time).toLocaleString()}</td>
+                      <td>{r.tool_code}</td>
+                      <td>{r.offset_um}</td>
+                      <td>
+                        {toHM(r.start_time)}–{toHM(r.end_time)}
+                      </td>
+                      <td>{r.rejected_by || "—"}</td>
+                    </tr>
+                  )}
+                </For>
+              </tbody>
+            </table>
+            <Show when={!rejections().length && !banLoading()}>
+              <p class="hint">暂无挡回流水</p>
             </Show>
           </section>
         </Show>

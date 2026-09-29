@@ -60,3 +60,18 @@ export function createSubmission(tool_code, offset_um) {
     body: JSON.stringify({ tool_code, offset_um: Number(offset_um) }),
   });
 }
+
+export function fetchBanWindow() {
+  return request("/ban/window");
+}
+
+export function updateBanWindow(start_time, end_time) {
+  return request("/ban/window", {
+    method: "PUT",
+    body: JSON.stringify({ start_time, end_time }),
+  });
+}
+
+export function fetchBanRejections() {
+  return request("/ban/rejections");
+}
