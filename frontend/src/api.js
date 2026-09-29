@@ -60,3 +60,22 @@ export function createSubmission(tool_code, offset_um) {
     body: JSON.stringify({ tool_code, offset_um: Number(offset_um) }),
   });
 }
+
+export function fetchCurfewSettings() {
+  return request("/curfew/settings");
+}
+
+export function updateCurfewSettings({ start_time, end_time, enabled }) {
+  return request("/curfew/settings", {
+    method: "PUT",
+    body: JSON.stringify({ start_time, end_time, enabled }),
+  });
+}
+
+export function fetchCurfewStatus() {
+  return request("/curfew/status");
+}
+
+export function fetchRejections() {
+  return request("/curfew/rejections");
+}

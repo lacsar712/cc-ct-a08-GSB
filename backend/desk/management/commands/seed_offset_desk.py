@@ -2,7 +2,7 @@ from django.core.management.base import BaseCommand
 from django.utils import timezone
 
 from desk.auth_utils import hash_password
-from desk.models import OffsetSubmission, User
+from desk.models import CurfewSettings, OffsetSubmission, User
 
 
 class Command(BaseCommand):
@@ -25,6 +25,9 @@ class Command(BaseCommand):
                 "is_active": True,
             },
         )
+
+        # 预置禁交设置单行；已存在则保留操作员改过的钟点，不随重启重置
+        CurfewSettings.objects.get_or_create(pk=1)
 
         now = timezone.now()
         seeds = [
